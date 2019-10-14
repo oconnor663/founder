@@ -1,0 +1,9 @@
+[package]
+name = "founder"
+version = "0.1.0"
+authors = ["Jack O'Connor <oconnor663@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+dirs = "2.0.2"
+bstr = "0.2.8"
