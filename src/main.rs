@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use duct::cmd;
 use std::collections::HashSet;
 use std::env;
@@ -14,7 +15,7 @@ fn fd_filter_thread(
     fd_buf_reader: &mut io::BufReader<&duct::ReaderHandle>,
     // By value, so that it's closed implicitly:
     mut fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
-) -> io::Result<()> {
+) -> Result<()> {
     // Start the fd child process with a stdout reader. Dropping this reader or
     // reading to EOF will automatically await (and potentially kill) the child
     // process.
@@ -28,7 +29,7 @@ fn fd_filter_thread(
                     // Fzf has exited. This thread should quit gracefully.
                     return Ok(());
                 } else {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         };
@@ -48,19 +49,20 @@ fn fd_filter_thread(
     }
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<()> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
-    // delay before the finder appears. Reading to EOF will automatically await
-    // the child process. This is unchecked() because it returns an error if
-    // the user's filter doesn't match anything, and we'll want to report that
+    // delay before fzf appears. Reading to EOF will automatically await the
+    // child process. This is unchecked() because it returns an error if the
+    // user's filter doesn't match anything, and we'll want to report that
     // error cleanly rather than crashing.
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
     let fzf_reader = cmd!("fzf")
         .stdin_file(fzf_stdin_read)
         .unchecked()
-        .reader()?;
+        .reader()
+        .context("opening fzf (is fzf installed?)")?;
     let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
     // Create the history dir (~/.local/share/founder or equivalent).
@@ -78,7 +80,7 @@ fn main() -> io::Result<()> {
             if e.kind() == io::ErrorKind::NotFound {
                 Vec::new()
             } else {
-                return Err(e);
+                return Err(e.into());
             }
         }
     };
@@ -113,11 +115,14 @@ fn main() -> io::Result<()> {
     // from fd will become input to fzf, if it's not a duplicate of what was
     // already shown from history. This is unchecked() because we might kill
     // it.
-    let fd_reader = cmd!("fd", "--type=f").unchecked().reader()?;
+    let fd_reader = cmd!("fd", "--type=f")
+        .unchecked()
+        .reader()
+        .context("opening fd (is fd installed?)")?;
     let mut fd_buf_reader = io::BufReader::new(&fd_reader);
 
     let mut fzf_output = Vec::new();
-    crossbeam_utils::thread::scope(|scope| -> io::Result<()> {
+    crossbeam_utils::thread::scope(|scope| -> Result<()> {
         // Start the background thread that will manage the fd pipe and
         // continue writing to the fzf pipe.
         let fd_thread_handle =
