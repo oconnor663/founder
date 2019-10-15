@@ -11,13 +11,13 @@ use std::os::unix::ffi::OsStrExt;
 
 fn fd_filter_thread(
     seen_history: &HashSet<&[u8]>,
+    fd_buf_reader: &mut io::BufReader<&duct::ReaderHandle>,
+    // By value, so that it's closed implicitly:
     mut fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
 ) -> io::Result<()> {
     // Start the fd child process with a stdout reader. Dropping this reader or
     // reading to EOF will automatically await (and potentially kill) the child
     // process.
-    let fd_reader = cmd!("fd", "--type=f").reader()?;
-    let mut fd_buf_reader = io::BufReader::new(fd_reader);
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -50,10 +50,17 @@ fn fd_filter_thread(
 
 fn main() -> io::Result<()> {
     // Start the fzf child process with a stdout reader and an explicit stdin
-    // pipe. Do this first to mimize the delay before the finder appears.
-    // Reading to EOF will automatically await the child process.
+    // pipe. Dropping the reader will implicitly kill fzf, though that will
+    // only happen if there's an unexpected error. Do this first to mimize the
+    // delay before the finder appears. Reading to EOF will automatically await
+    // the child process. This is unchecked() because it returns an error if
+    // the user's filter doesn't match anything, and we'll want to report that
+    // error cleanly rather than crashing.
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let mut fzf_reader = cmd!("fzf").stdin_file(fzf_stdin_read).reader()?;
+    let fzf_reader = cmd!("fzf")
+        .stdin_file(fzf_stdin_read)
+        .unchecked()
+        .reader()?;
     let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
     // Create the history dir (~/.local/share/founder or equivalent).
@@ -102,28 +109,41 @@ fn main() -> io::Result<()> {
     }
     fzf_buf_writer.flush()?;
 
-    let selection = crossbeam_utils::thread::scope(|scope| {
-        // Start the background thread that will manage the fd child process
-        // and continue writing to the fzf pipe.
-        let fd_thread_handle = scope.spawn(|_| fd_filter_thread(&seen_history, fzf_buf_writer));
+    // Start the fd child process with a stdout reader. Each line of output
+    // from fd will become input to fzf, if it's not a duplicate of what was
+    // already shown from history. This is unchecked() because we might kill
+    // it.
+    let fd_reader = cmd!("fd", "--type=f").unchecked().reader()?;
+    let mut fd_buf_reader = io::BufReader::new(&fd_reader);
 
-        // Read the user's selection from the output of fzf. This automatically
-        // awaits fzf after reading EOF.
-        let mut selection = Vec::new();
-        let read_result = fzf_reader.read_to_end(&mut selection);
+    let mut fzf_output = Vec::new();
+    crossbeam_utils::thread::scope(|scope| -> io::Result<()> {
+        // Start the background thread that will manage the fd pipe and
+        // continue writing to the fzf pipe.
+        let fd_thread_handle =
+            scope.spawn(|_| fd_filter_thread(&seen_history, &mut fd_buf_reader, fzf_buf_writer));
 
-        // Join the fd thread. If it didn't finish writing its output to the
-        // fzf pipe, it should gracefully exit after a closed pipe error.
-        // TODO: Kill it?
-        let fd_result = fd_thread_handle.join().unwrap();
+        // Read the selection from fzf. (Fzf might return an error, but we'll
+        // check that below.)
+        (&fzf_reader).read_to_end(&mut fzf_output)?;
 
-        read_result.and(fd_result).map(|_| selection)
+        // Kill fd and explicitly join the fd thread.
+        fd_reader.kill()?;
+        fd_thread_handle.join().unwrap()?;
+
+        Ok(())
     })
     .unwrap()?;
 
+    // If Fzf returned an error, exit with that error.
+    let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
+    if !fzf_status.success() {
+        std::process::exit(fzf_status.code().unwrap_or(1));
+    }
+
     // Write the selection to stdout. Fzf appends a newline, which we strip.
-    assert_eq!(selection[selection.len() - 1], '\n' as u8);
-    let stripped_selection = &selection[..selection.len() - 1];
+    assert_eq!(fzf_output[fzf_output.len() - 1], '\n' as u8);
+    let stripped_selection = &fzf_output[..fzf_output.len() - 1];
     io::stdout().write_all(stripped_selection)?;
 
     // Canonicalize the selection and add that to the history file. Put the
