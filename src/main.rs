@@ -144,6 +144,7 @@ fn main() -> Result<()> {
     let mut seen_history = HashSet::<&[u8]>::new();
     let mut history_lines: usize = 0;
     for line in history_lines_from_most_recent(&history_bytes) {
+        history_lines += 1;
         let mut relative_line = Path::new(OsStr::from_bytes(line));
         if relative_line.starts_with(&cwd) {
             relative_line = relative_line.strip_prefix(&cwd).unwrap();
@@ -155,7 +156,6 @@ fn main() -> Result<()> {
         fzf_buf_writer.write(relative_line_bytes)?;
         fzf_buf_writer.write(b"\n")?;
         seen_history.insert(relative_line_bytes);
-        history_lines += 1;
     }
     fzf_buf_writer.flush()?;
 
