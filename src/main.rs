@@ -59,6 +59,9 @@ fn filter_fd_output_ioresult(
     let mut line = Vec::new();
     loop {
         line.clear();
+        // Read a line from fd. This will implicitly wait on the fd child
+        // process if the read encounters EOF, though if fd was killed then the
+        // killing thread may have awaited it already.
         let n = fd_buf_reader.read_until(b'\n', &mut line)?;
         if n == 0 {
             // The output from fd is finished. This thread is done.
@@ -215,14 +218,16 @@ fn do_find() -> Result<()> {
             None
         };
 
-        // Read the selection from fzf. Fzf returning a non-zero status is
-        // unchecked() here. We'll check that explicitly below.
+        // Read the selection from fzf. This implicitly waits on the fzf child
+        // process, but the child returning a non-zero status is unchecked()
+        // here. We'll check that explicitly below.
         (&fzf_reader).read_to_end(&mut fzf_output)?;
 
         // Kill fd if it's still running, and return an error if the fd thread
-        // encountered one. Note that because of this potential kill signal, fd
+        // encountered one. This implicitly waits on the fd child process. Note
+        // that because of this potential kill signal, fd is unchecked(), and
         // exiting with a non-zero status is not considered an error. Errors
-        // here are either a rare OS issue (out of memory?) or a bug.
+        // here are either a rare OS failure (out of memory?) or a bug.
         fd_reader.kill()?;
         fd_thread.join().unwrap()?;
 
