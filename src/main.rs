@@ -159,7 +159,7 @@ fn do_find() -> Result<()> {
     // if the user's filter doesn't match anything, and we'll want to exit with
     // the same code in that case without printing a failure message.
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let fzf_reader = cmd!("fzf")
+    let fzf_reader = cmd!("fzf-tmux")
         .stdin_file(fzf_stdin_read)
         .unchecked()
         .reader()
