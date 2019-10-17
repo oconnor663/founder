@@ -13,14 +13,39 @@ use std::os::unix::ffi::OsStrExt;
 
 const MAX_HISTORY_LINES: usize = 1000;
 
-fn history_path() -> Result<&'static PathBuf> {
+fn history_path() -> Result<&'static Path> {
     static HISTORY_PATH: OnceCell<PathBuf> = OnceCell::new();
-    HISTORY_PATH.get_or_try_init(|| {
-        let user_data_dir = dirs::data_local_dir().ok_or_else(|| anyhow!("no data dir"))?;
-        let founder_dir = user_data_dir.join("founder");
-        fs::create_dir_all(&founder_dir).context("failed to create history dir")?;
-        Ok(founder_dir.join("history"))
-    })
+    HISTORY_PATH
+        .get_or_try_init(|| {
+            let user_data_dir = dirs::data_local_dir().ok_or_else(|| anyhow!("no data dir"))?;
+            let founder_dir = user_data_dir.join("founder");
+            fs::create_dir_all(&founder_dir).context("failed to create history dir")?;
+            Ok(founder_dir.join("history"))
+        })
+        .map(|p| p.as_ref())
+}
+
+fn history_bytes() -> Result<&'static [u8]> {
+    static HISTORY_BYTES: OnceCell<Vec<u8>> = OnceCell::new();
+    HISTORY_BYTES
+        .get_or_try_init(|| match fs::read(history_path()?) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                if e.kind() == io::ErrorKind::NotFound {
+                    // If the file didn't exist, just make an empty Vec.
+                    Ok(Vec::new())
+                } else {
+                    Err(e).context("failed to read history")
+                }
+            }
+        })
+        .map(|b| b.as_ref())
+}
+
+// These lines do not include the terminating newline.
+fn history_lines_from_most_recent() -> Result<impl Iterator<Item = &'static [u8]>> {
+    let bytes = history_bytes()?;
+    Ok(bstr::ByteSlice::rsplit_str(bytes, "\n").filter(|line| !line.is_empty()))
 }
 
 fn filter_fd_output(
@@ -29,9 +54,6 @@ fn filter_fd_output(
     // By value, so that it's closed implicitly:
     mut fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
 ) -> Result<()> {
-    // Start the fd child process with a stdout reader. Dropping this reader or
-    // reading to EOF will automatically await (and potentially kill) the child
-    // process.
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -62,17 +84,12 @@ fn filter_fd_output(
     }
 }
 
-// These lines do not include the terminating newline.
-fn history_lines_from_most_recent(history_bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-    bstr::ByteSlice::rsplit_str(&history_bytes[..], "\n").filter(|line| !line.is_empty())
-}
-
-fn compact_history_file(history_bytes: &[u8]) -> Result<()> {
+fn compact_history_file() -> Result<()> {
     // Iterate over all the history lines, starting with the most recent, and
     // collect the first unique occurrence of each one into a vector.
     let mut lines_set = HashSet::new();
     let mut ordered_unique_lines = Vec::new();
-    for line in history_lines_from_most_recent(history_bytes) {
+    for line in history_lines_from_most_recent()? {
         if lines_set.insert(line) {
             ordered_unique_lines.push(line);
         }
@@ -125,9 +142,9 @@ fn do_find() -> Result<()> {
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
     // delay before fzf appears. Reading to EOF will automatically await the
-    // child process. This is unchecked() because it returns an error if the
-    // user's filter doesn't match anything, and we'll want to report that
-    // error cleanly rather than crashing.
+    // fzf child process. This is unchecked() because it returns an error code
+    // if the user's filter doesn't match anything, and we'll want to exit with
+    // the same code in that case without printing a failure message.
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
     let fzf_reader = cmd!("fzf")
         .stdin_file(fzf_stdin_read)
@@ -135,19 +152,6 @@ fn do_find() -> Result<()> {
         .reader()
         .context("failed to start fzf (is is installed?)")?;
     let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
-
-    // Read all the bytes of the history file. If it doesn't exist, create an
-    // empty vec instead.
-    let history_bytes = match fs::read(history_path()?) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            if e.kind() == io::ErrorKind::NotFound {
-                Vec::new()
-            } else {
-                return Err(e).context("failed to read history");
-            }
-        }
-    };
 
     // Iterate over history lines backwards from the end. That means that the
     // most recently appended lines come first. For each line, if the current
@@ -159,7 +163,7 @@ fn do_find() -> Result<()> {
     let mut seen_history = HashSet::<&[u8]>::new();
     let mut history_lines: usize = 0;
     #[allow(clippy::explicit_counter_loop)]
-    for line in history_lines_from_most_recent(&history_bytes) {
+    for line in history_lines_from_most_recent()? {
         history_lines += 1;
         let mut relative_line = Path::new(OsStr::from_bytes(line));
         if relative_line.starts_with(&cwd) {
@@ -177,8 +181,8 @@ fn do_find() -> Result<()> {
 
     // Start the fd child process with a stdout reader. Each line of output
     // from fd will become input to fzf, if it's not a duplicate of what was
-    // already shown from history. This is unchecked() because we might kill
-    // it.
+    // already shown from history. This is unchecked() because we might kill it
+    // if it's still running when the user makes a selection.
     let fd_reader = cmd!("fd", "--type=f")
         .unchecked()
         .reader()
@@ -193,9 +197,10 @@ fn do_find() -> Result<()> {
             scope.spawn(|_| filter_fd_output(&seen_history, &mut fd_buf_reader, fzf_buf_writer));
 
         // If the history file is at capacity, start another background thread
-        // to compact it. Leaving this scope will join this thread.
+        // to compact it. We've already finished reading from the history file
+        // by this point, so rewriting it won't cause any problems.
         let compact_thread = if history_lines >= MAX_HISTORY_LINES {
-            Some(scope.spawn(|_| compact_history_file(&history_bytes)))
+            Some(scope.spawn(|_| compact_history_file()))
         } else {
             None
         };
@@ -204,7 +209,9 @@ fn do_find() -> Result<()> {
         // check that below.)
         (&fzf_reader).read_to_end(&mut fzf_output)?;
 
-        // Kill fd, and return an error if the fd thread encountered one.
+        // Kill fd if it's still running, and return an error if the fd thread
+        // encountered one. Note that because of this potential kill signal, fd
+        // exiting with a non-zero status is not considered an error.
         fd_reader.kill()?;
         fd_thread.join().unwrap()?;
 
