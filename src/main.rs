@@ -48,26 +48,18 @@ fn history_lines_from_most_recent() -> Result<impl Iterator<Item = &'static [u8]
     Ok(bstr::ByteSlice::rsplit_str(bytes, "\n").filter(|line| !line.is_empty()))
 }
 
-fn filter_fd_output(
+// Returns an io::Result, so that broken pipe errors can get caught and
+// suppressed by the caller.
+fn filter_fd_output_ioresult(
     seen_history: &HashSet<&[u8]>,
     fd_buf_reader: &mut io::BufReader<&duct::ReaderHandle>,
     // By value, so that it's closed implicitly:
     mut fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
-) -> Result<()> {
+) -> io::Result<()> {
     let mut line = Vec::new();
     loop {
         line.clear();
-        let n = match fd_buf_reader.read_until(b'\n', &mut line) {
-            Ok(n) => n,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::BrokenPipe {
-                    // Fzf has exited. This thread should quit gracefully.
-                    return Ok(());
-                } else {
-                    return Err(e.into());
-                }
-            }
-        };
+        let n = fd_buf_reader.read_until(b'\n', &mut line)?;
         if n == 0 {
             // The output from fd is finished. This thread is done.
             fzf_buf_writer.flush()?;
@@ -81,6 +73,24 @@ fn filter_fd_output(
             continue;
         }
         fzf_buf_writer.write_all(&line)?;
+    }
+}
+
+fn filter_fd_output(
+    seen_history: &HashSet<&[u8]>,
+    fd_buf_reader: &mut io::BufReader<&duct::ReaderHandle>,
+    fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
+) -> Result<()> {
+    match filter_fd_output_ioresult(seen_history, fd_buf_reader, fzf_buf_writer) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                // Suppress broken pipe errors.
+                Ok(())
+            } else {
+                Err(e).context("failed to filter fd output")
+            }
+        }
     }
 }
 
@@ -205,13 +215,14 @@ fn do_find() -> Result<()> {
             None
         };
 
-        // Read the selection from fzf. (Fzf might return an error, but we'll
-        // check that below.)
+        // Read the selection from fzf. Fzf returning a non-zero status is
+        // unchecked() here. We'll check that explicitly below.
         (&fzf_reader).read_to_end(&mut fzf_output)?;
 
         // Kill fd if it's still running, and return an error if the fd thread
         // encountered one. Note that because of this potential kill signal, fd
-        // exiting with a non-zero status is not considered an error.
+        // exiting with a non-zero status is not considered an error. Errors
+        // here are either a rare OS issue (out of memory?) or a bug.
         fd_reader.kill()?;
         fd_thread.join().unwrap()?;
 
@@ -224,17 +235,20 @@ fn do_find() -> Result<()> {
     })
     .unwrap()?;
 
-    // If Fzf returned an error, exit with that error.
+    // If Fzf exited with an error code, we exit with that same code. For
+    // example, we get an error code if the user's filter didn't match
+    // anything.
     let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
     if !fzf_status.success() {
         std::process::exit(fzf_status.code().unwrap_or(1));
     }
 
-    // Fzf appends a newline, which we strip.
+    // Fzf appends a newline to the selection. Strip it off.
     assert_eq!(fzf_output[fzf_output.len() - 1], b'\n');
     let stripped_selection = &fzf_output[..fzf_output.len() - 1];
 
-    // Canonicalize the selection and add that to the history file.
+    // Canonicalize the selection and add that to the history file. This can
+    // fail if the selection no longer exists.
     add_selection_to_history(stripped_selection)?;
 
     // Write the selection to stdout.
