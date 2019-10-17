@@ -105,7 +105,22 @@ fn compact_history_file(history_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn add_selection_to_history(selection: &[u8]) -> Result<()> {
+    let selection_osstr = OsStr::from_bytes(selection);
+    let mut canonical_path: OsString = fs::canonicalize(selection_osstr)
+        .with_context(|| format!("trying to canonicalize {:?}", selection_osstr))?
+        .into();
+    // The selection does not have an extra newline at the end, so we add one.
+    canonical_path.push("\n");
+    let mut history_file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(history_path()?)?;
+    history_file.write_all(canonical_path.as_bytes())?;
+    Ok(())
+}
+
+fn do_find() -> Result<()> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
@@ -173,20 +188,29 @@ fn main() -> Result<()> {
     crossbeam_utils::thread::scope(|scope| -> Result<()> {
         // Start the background thread that reads the fd pipe and continues
         // writing to the fzf pipe.
-        scope.spawn(|_| filter_fd_output(&seen_history, &mut fd_buf_reader, fzf_buf_writer));
+        let fd_thread =
+            scope.spawn(|_| filter_fd_output(&seen_history, &mut fd_buf_reader, fzf_buf_writer));
 
         // If the history file is at capacity, start another background thread
         // to compact it. Leaving this scope will join this thread.
-        if history_lines >= MAX_HISTORY_LINES {
-            scope.spawn(|_| compact_history_file(&history_bytes));
-        }
+        let compact_thread = if history_lines >= MAX_HISTORY_LINES {
+            Some(scope.spawn(|_| compact_history_file(&history_bytes)))
+        } else {
+            None
+        };
 
         // Read the selection from fzf. (Fzf might return an error, but we'll
         // check that below.)
         (&fzf_reader).read_to_end(&mut fzf_output)?;
 
-        // Kill fd. We'll explicitly join that thread as we leave this scope.
+        // Kill fd, and return an error if the fd thread encountered one.
         fd_reader.kill()?;
+        fd_thread.join().unwrap()?;
+
+        // Return an error if the history compaction thread encountered one.
+        if let Some(thread) = compact_thread {
+            thread.join().unwrap()?;
+        }
 
         Ok(())
     })
@@ -198,22 +222,26 @@ fn main() -> Result<()> {
         std::process::exit(fzf_status.code().unwrap_or(1));
     }
 
-    // Write the selection to stdout. Fzf appends a newline, which we strip.
+    // Fzf appends a newline, which we strip.
     assert_eq!(fzf_output[fzf_output.len() - 1], '\n' as u8);
     let stripped_selection = &fzf_output[..fzf_output.len() - 1];
+
+    // Canonicalize the selection and add that to the history file.
+    add_selection_to_history(stripped_selection)?;
+
+    // Write the selection to stdout.
     io::stdout().write_all(stripped_selection)?;
     io::stdout().flush()?;
-
-    // Canonicalize the selection and add that to the history file. Put the
-    // newline back for this part.
-    let mut canonical_path: OsString =
-        fs::canonicalize(OsStr::from_bytes(stripped_selection))?.into();
-    canonical_path.push("\n");
-    let mut history_file = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(history_path()?)?;
-    history_file.write_all(canonical_path.as_os_str().as_bytes())?;
-
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<OsString> = env::args_os().collect();
+    if args.len() > 1 {
+        assert_eq!(args.len(), 3, "unexpected number of args");
+        assert_eq!(&args[1], "--add", "unknown arg");
+        add_selection_to_history(args[2].as_bytes())
+    } else {
+        do_find()
+    }
 }
