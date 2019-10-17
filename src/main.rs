@@ -18,7 +18,7 @@ fn history_path() -> Result<&'static PathBuf> {
     HISTORY_PATH.get_or_try_init(|| {
         let user_data_dir = dirs::data_local_dir().ok_or_else(|| anyhow!("no data dir"))?;
         let founder_dir = user_data_dir.join("founder");
-        fs::create_dir_all(&founder_dir).context("creating history dir")?;
+        fs::create_dir_all(&founder_dir).context("failed to create history dir")?;
         Ok(founder_dir.join("history"))
     })
 }
@@ -108,7 +108,7 @@ fn compact_history_file(history_bytes: &[u8]) -> Result<()> {
 fn add_selection_to_history(selection: &[u8]) -> Result<()> {
     let selection_osstr = OsStr::from_bytes(selection);
     let mut canonical_path: OsString = fs::canonicalize(selection_osstr)
-        .with_context(|| format!("trying to canonicalize {:?}", selection_osstr))?
+        .with_context(|| format!("failed to canonicalize {:?}", selection_osstr))?
         .into();
     // The selection does not have an extra newline at the end, so we add one.
     canonical_path.push("\n");
@@ -133,7 +133,7 @@ fn do_find() -> Result<()> {
         .stdin_file(fzf_stdin_read)
         .unchecked()
         .reader()
-        .context("opening fzf (is fzf installed?)")?;
+        .context("failed to start fzf (is is installed?)")?;
     let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
     // Read all the bytes of the history file. If it doesn't exist, create an
@@ -144,7 +144,7 @@ fn do_find() -> Result<()> {
             if e.kind() == io::ErrorKind::NotFound {
                 Vec::new()
             } else {
-                return Err(e).context("reading history");
+                return Err(e).context("failed to read history");
             }
         }
     };
@@ -182,7 +182,7 @@ fn do_find() -> Result<()> {
     let fd_reader = cmd!("fd", "--type=f")
         .unchecked()
         .reader()
-        .context("opening fd (is fd installed?)")?;
+        .context("failed to start fd (is it installed?)")?;
     let mut fd_buf_reader = io::BufReader::new(&fd_reader);
 
     let mut fzf_output = Vec::new();
