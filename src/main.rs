@@ -35,7 +35,7 @@ fn filter_fd_output(
     let mut line = Vec::new();
     loop {
         line.clear();
-        let n = match fd_buf_reader.read_until('\n' as u8, &mut line) {
+        let n = match fd_buf_reader.read_until(b'\n', &mut line) {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() == io::ErrorKind::BrokenPipe {
@@ -53,7 +53,7 @@ fn filter_fd_output(
         }
         // Check the line we just read against the lines from the history file,
         // and suppress any duplicates.
-        assert_eq!(line[line.len() - 1], '\n' as u8);
+        assert_eq!(line[line.len() - 1], b'\n');
         let stripped_line = &line[..line.len() - 1];
         if seen_history.contains(stripped_line) {
             continue;
@@ -158,6 +158,7 @@ fn do_find() -> Result<()> {
     let cwd = env::current_dir()?;
     let mut seen_history = HashSet::<&[u8]>::new();
     let mut history_lines: usize = 0;
+    #[allow(clippy::explicit_counter_loop)]
     for line in history_lines_from_most_recent(&history_bytes) {
         history_lines += 1;
         let mut relative_line = Path::new(OsStr::from_bytes(line));
@@ -168,8 +169,8 @@ fn do_find() -> Result<()> {
         if seen_history.contains(relative_line_bytes) {
             continue;
         }
-        fzf_buf_writer.write(relative_line_bytes)?;
-        fzf_buf_writer.write(b"\n")?;
+        fzf_buf_writer.write_all(relative_line_bytes)?;
+        fzf_buf_writer.write_all(b"\n")?;
         seen_history.insert(relative_line_bytes);
     }
     fzf_buf_writer.flush()?;
@@ -223,7 +224,7 @@ fn do_find() -> Result<()> {
     }
 
     // Fzf appends a newline, which we strip.
-    assert_eq!(fzf_output[fzf_output.len() - 1], '\n' as u8);
+    assert_eq!(fzf_output[fzf_output.len() - 1], b'\n');
     let stripped_selection = &fzf_output[..fzf_output.len() - 1];
 
     // Canonicalize the selection and add that to the history file.
