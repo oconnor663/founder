@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::io::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 // Unix-only for now.
 use std::os::unix::ffi::OsStrExt;
 
@@ -48,6 +48,19 @@ fn history_lines_from_most_recent() -> Result<impl Iterator<Item = &'static [u8]
     Ok(bstr::ByteSlice::rsplit_str(bytes, "\n").filter(|line| !line.is_empty()))
 }
 
+fn home_dir() -> io::Result<&'static Path> {
+    static HOME_DIR: OnceCell<PathBuf> = OnceCell::new();
+    HOME_DIR
+        .get_or_try_init(|| match dirs::home_dir() {
+            Some(homedir) => Ok(homedir),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no home directory configured",
+            )),
+        })
+        .map(|p| p.as_ref())
+}
+
 // Returns an io::Result, so that broken pipe errors can get caught and
 // suppressed by the caller.
 fn filter_fd_output_ioresult(
@@ -75,7 +88,7 @@ fn filter_fd_output_ioresult(
         if seen_history.contains(stripped_line) {
             continue;
         }
-        fzf_buf_writer.write_all(&line)?;
+        write_path_to_fzf(stripped_line, &mut fzf_buf_writer)?;
     }
 }
 
@@ -150,6 +163,52 @@ fn add_selection_to_history(selection: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// Substitute ~/ for the home directory.
+fn write_path_to_fzf(
+    path_bytes: &[u8],
+    fzf_buf_writer: &mut io::BufWriter<os_pipe::PipeWriter>,
+) -> io::Result<()> {
+    let path = Path::new(OsStr::from_bytes(path_bytes));
+    let mut separator_buf = [0; 4];
+    let separator = MAIN_SEPARATOR.encode_utf8(&mut separator_buf);
+    if path.starts_with(home_dir()?) {
+        // If the path is underneath the home directory, substitute in a ~/.
+        let rest = path.strip_prefix(home_dir()?).unwrap();
+        fzf_buf_writer.write_all(b"~")?;
+        fzf_buf_writer.write_all(separator.as_bytes())?;
+        fzf_buf_writer.write_all(rest.as_os_str().as_bytes())?;
+    } else if path.starts_with("~") {
+        // If the first entire component of the path is a literal ~, prepend a
+        // dot-slash. That prevents us from getting confused when we read
+        // leading ~ back out from FZF.
+        fzf_buf_writer.write_all(b".")?;
+        fzf_buf_writer.write_all(separator.as_bytes())?;
+        fzf_buf_writer.write_all(path_bytes)?;
+    } else {
+        // Otherwise just write the path without any changes.
+        fzf_buf_writer.write_all(path_bytes)?;
+    }
+    fzf_buf_writer.write_all(b"\n")?;
+    Ok(())
+}
+
+fn read_path_from_fzf(mut reader: &duct::ReaderHandle, output: &mut Vec<u8>) -> Result<()> {
+    reader.read_to_end(output)?;
+    let path = Path::new(OsStr::from_bytes(output));
+    if path.starts_with("~") {
+        // If the first entire component is ~, then we need to expand that to
+        // the home directory.
+        let rest = path.strip_prefix("~").unwrap();
+        let mut separator_buf = [0; 4];
+        let separator = MAIN_SEPARATOR.encode_utf8(&mut separator_buf);
+        let mut expanded = home_dir()?.as_os_str().as_bytes().to_vec();
+        expanded.extend_from_slice(separator.as_bytes());
+        expanded.extend_from_slice(rest.as_os_str().as_bytes());
+        *output = expanded;
+    }
+    Ok(())
+}
+
 fn do_find() -> Result<()> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
@@ -186,8 +245,7 @@ fn do_find() -> Result<()> {
         if seen_history.contains(relative_line_bytes) {
             continue;
         }
-        fzf_buf_writer.write_all(relative_line_bytes)?;
-        fzf_buf_writer.write_all(b"\n")?;
+        write_path_to_fzf(relative_line_bytes, &mut fzf_buf_writer)?;
         seen_history.insert(relative_line_bytes);
     }
     fzf_buf_writer.flush()?;
@@ -221,7 +279,7 @@ fn do_find() -> Result<()> {
         // Read the selection from fzf. This implicitly waits on the fzf child
         // process, but the child returning a non-zero status is unchecked()
         // here. We'll check that explicitly below.
-        (&fzf_reader).read_to_end(&mut fzf_output)?;
+        read_path_from_fzf(&fzf_reader, &mut fzf_output)?;
 
         // Kill fd if it's still running, and return an error if the fd thread
         // encountered one. This implicitly waits on the fd child process. Note
