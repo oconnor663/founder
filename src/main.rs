@@ -386,9 +386,9 @@ fn finder_loop() -> Result<()> {
         let key = parts.next().expect("no key line");
         let selection = expand_selection(parts.next().expect("no selection line"))?;
 
-        // Check the key before the status. The user may have a query that matches
-        // nothing, in which case Ctrl-T will lead to a non-zero status, which we
-        // ignore.
+        // Check the key before the status. The user may have a query that
+        // matches nothing, in which case Ctrl-T will lead to a non-zero
+        // status, which we ignore.
         match key {
             b"" => {
                 // This is the newline case, which means the user has made a
@@ -402,12 +402,14 @@ fn finder_loop() -> Result<()> {
                     std::process::exit(status.code().unwrap_or(1));
                 }
 
-                // Canonicalize the selection and add that to the history file. This can
-                // fail if the selection no longer exists.
+                // Canonicalize the selection and add that to the history file.
+                // This can fail if the selection no longer exists.
                 add_selection_to_history(&selection)?;
 
-                // Write the selection to stdout.
+                // Write the selection to stdout. Add a newline to be
+                // compatible with FZF.
                 io::stdout().write_all(&selection)?;
+                io::stdout().write_all(b"\n")?;
                 io::stdout().flush()?;
                 return Ok(());
             }
