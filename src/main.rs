@@ -213,7 +213,7 @@ fn expand_selection(selection: &[u8]) -> Result<Vec<u8>> {
 }
 
 // Includes global history, ignores hidden local files.
-fn default_finder() -> Result<(ExitStatus, Vec<u8>)> {
+fn combined_finder() -> Result<(ExitStatus, Vec<u8>)> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
@@ -311,45 +311,113 @@ fn default_finder() -> Result<(ExitStatus, Vec<u8>)> {
     Ok((fzf_status, fzf_output))
 }
 
-fn run_finder() -> Result<()> {
-    let (status, output) = default_finder()?;
+// Includes hidden files, but no history.
+fn local_finder() -> Result<(ExitStatus, Vec<u8>)> {
+    let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
+    let fzf_reader = cmd!(
+        "fzf-tmux",
+        "--prompt=local> ",
+        "--expect=ctrl-t",
+        "--print-query"
+    )
+    .stdin_file(fzf_stdin_read)
+    .unchecked()
+    .reader()
+    .context("failed to start fzf (is is installed?)")?;
+    let fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
-    // If Fzf exited with an error code, we exit with that same code. For
-    // example, we get an error code if the user's filter didn't match
-    // anything.
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    // Include --hidden files in this mode.
+    let fd_reader = cmd!("fd", "--type=f", "--hidden")
+        .unchecked()
+        .reader()
+        .context("failed to start fd (is it installed?)")?;
+    let mut fd_buf_reader = io::BufReader::new(&fd_reader);
+
+    let empty_history = HashSet::new();
+    let mut fzf_output = Vec::new();
+    crossbeam_utils::thread::scope(|scope| -> Result<()> {
+        // Start the background thread that reads the fd pipe and continues
+        // writing to the fzf pipe. There is no history in this mode.
+        let fd_thread =
+            scope.spawn(|_| filter_fd_output(&empty_history, &mut fd_buf_reader, fzf_buf_writer));
+
+        // Read the selection from fzf. This implicitly waits on the fzf child
+        // process, but the child returning a non-zero status is unchecked()
+        // here. We'll check that explicitly below.
+        (&fzf_reader).read_to_end(&mut fzf_output)?;
+
+        // Kill fd if it's still running, and return an error if the fd thread
+        // encountered one. This implicitly waits on the fd child process. Note
+        // that because of this potential kill signal, fd is unchecked(), and
+        // exiting with a non-zero status is not considered an error. Errors
+        // here are either a rare OS failure (out of memory?) or a bug.
+        fd_reader.kill()?;
+        fd_thread.join().unwrap()?;
+
+        Ok(())
+    })
+    .unwrap()?;
+
+    let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
+    Ok((fzf_status, fzf_output))
+}
+
+fn finder_loop() -> Result<()> {
+    let mut mode: u8 = 0;
+    loop {
+        const NUM_MODES: u8 = 2;
+        let (status, output) = match mode {
+            0 => combined_finder()?,
+            1 => local_finder()?,
+            _ => unreachable!("invalid mode"),
+        };
+
+        // If Fzf exited with an error code, we exit with that same code. For
+        // example, we get an error code if the user's filter didn't match
+        // anything.
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+
+        // The first line of output is the query string, the second is the
+        // selection key (enter or ctrl-t), and the third line is the selection
+        // (possibly empty with an accompanying error status). Note that these
+        // split components will not include trailing newlines.
+        let mut parts = bstr::ByteSlice::split_str(&output[..], "\n");
+        let query = parts.next().expect("no query line");
+        let key = parts.next().expect("no key line");
+        let selection = expand_selection(parts.next().expect("no selection line"))?;
+
+        // Check the key before the status. The user may have a query that matches
+        // nothing, in which case Ctrl-T will lead to a non-zero status, which we
+        // ignore.
+        match key {
+            b"" => {
+                // This is the newline case, which means the user has made a
+                // selection. Record that selection to history, write it to
+                // stdout, and exit.
+
+                // Canonicalize the selection and add that to the history file. This can
+                // fail if the selection no longer exists.
+                add_selection_to_history(&selection)?;
+
+                // Write the selection to stdout.
+                io::stdout().write_all(&selection)?;
+                io::stdout().flush()?;
+                return Ok(());
+            }
+            b"ctrl-t" => {
+                // The user pressed Ctrl-T. We change modes, preserving the
+                // query string, and repeat this loop.
+                mode = (mode + 1) % NUM_MODES;
+                continue;
+            }
+            _ => panic!(
+                "unexpected selector key: {:?}",
+                String::from_utf8_lossy(key)
+            ),
+        }
     }
-
-    // The first line of output is the query string, the second is the
-    // selection key (enter or ctrl-t), and the third line is the selection
-    // (possibly empty with an accompanying error status). Note that these
-    // split components will not include trailing newlines.
-    let mut parts = bstr::ByteSlice::split_str(&output[..], "\n");
-    let query = parts.next().expect("no query line");
-    let key = parts.next().expect("no key line");
-    let selection = expand_selection(parts.next().expect("no selection line"))?;
-
-    // Check the key before the status. The user may have a query that matches
-    // nothing, in which case Ctrl-T will lead to a non-zero status, which we
-    // ignore.
-    match key {
-        b"" => (), // empty means newline here, fall through
-        b"ctrl-t" => panic!("CTRL-T woo"),
-        _ => panic!(
-            "unexpected selector key: {:?}",
-            String::from_utf8_lossy(key)
-        ),
-    }
-
-    // Canonicalize the selection and add that to the history file. This can
-    // fail if the selection no longer exists.
-    add_selection_to_history(&selection)?;
-
-    // Write the selection to stdout.
-    io::stdout().write_all(&selection)?;
-    io::stdout().flush()?;
-    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -359,6 +427,6 @@ fn main() -> Result<()> {
         assert_eq!(&args[1], "--add", "unknown arg");
         add_selection_to_history(args[2].as_bytes())
     } else {
-        run_finder()
+        finder_loop()
     }
 }
