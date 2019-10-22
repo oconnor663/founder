@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::process::ExitStatus;
 // Unix-only for now.
 use std::os::unix::ffi::OsStrExt;
 
@@ -192,24 +193,27 @@ fn write_path_to_fzf(
     Ok(())
 }
 
-fn read_path_from_fzf(mut reader: &duct::ReaderHandle, output: &mut Vec<u8>) -> Result<()> {
-    reader.read_to_end(output)?;
-    let path = Path::new(OsStr::from_bytes(output));
+// Expands ~/
+fn expand_selection(selection: &[u8]) -> Result<Vec<u8>> {
+    let path = Path::new(OsStr::from_bytes(selection));
+    let mut expanded;
     if path.starts_with("~") {
         // If the first entire component is ~, then we need to expand that to
         // the home directory.
         let rest = path.strip_prefix("~").unwrap();
         let mut separator_buf = [0; 4];
         let separator = MAIN_SEPARATOR.encode_utf8(&mut separator_buf);
-        let mut expanded = home_dir()?.as_os_str().as_bytes().to_vec();
+        expanded = home_dir()?.as_os_str().as_bytes().to_vec();
         expanded.extend_from_slice(separator.as_bytes());
         expanded.extend_from_slice(rest.as_os_str().as_bytes());
-        *output = expanded;
+    } else {
+        expanded = selection.to_vec();
     }
-    Ok(())
+    Ok(expanded)
 }
 
-fn do_find() -> Result<()> {
+// Includes global history, ignores hidden local files.
+fn default_finder() -> Result<(ExitStatus, Vec<u8>)> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
@@ -218,11 +222,16 @@ fn do_find() -> Result<()> {
     // if the user's filter doesn't match anything, and we'll want to exit with
     // the same code in that case without printing a failure message.
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let fzf_reader = cmd!("fzf-tmux")
-        .stdin_file(fzf_stdin_read)
-        .unchecked()
-        .reader()
-        .context("failed to start fzf (is is installed?)")?;
+    let fzf_reader = cmd!(
+        "fzf-tmux",
+        "--prompt=combined> ",
+        "--expect=ctrl-t",
+        "--print-query"
+    )
+    .stdin_file(fzf_stdin_read)
+    .unchecked()
+    .reader()
+    .context("failed to start fzf (is is installed?)")?;
     let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
     // Iterate over history lines backwards from the end. That means that the
@@ -279,7 +288,7 @@ fn do_find() -> Result<()> {
         // Read the selection from fzf. This implicitly waits on the fzf child
         // process, but the child returning a non-zero status is unchecked()
         // here. We'll check that explicitly below.
-        read_path_from_fzf(&fzf_reader, &mut fzf_output)?;
+        (&fzf_reader).read_to_end(&mut fzf_output)?;
 
         // Kill fd if it's still running, and return an error if the fd thread
         // encountered one. This implicitly waits on the fd child process. Note
@@ -298,24 +307,47 @@ fn do_find() -> Result<()> {
     })
     .unwrap()?;
 
+    let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
+    Ok((fzf_status, fzf_output))
+}
+
+fn run_finder() -> Result<()> {
+    let (status, output) = default_finder()?;
+
     // If Fzf exited with an error code, we exit with that same code. For
     // example, we get an error code if the user's filter didn't match
     // anything.
-    let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
-    if !fzf_status.success() {
-        std::process::exit(fzf_status.code().unwrap_or(1));
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
     }
 
-    // Fzf appends a newline to the selection. Strip it off.
-    assert_eq!(fzf_output[fzf_output.len() - 1], b'\n');
-    let stripped_selection = &fzf_output[..fzf_output.len() - 1];
+    // The first line of output is the query string, the second is the
+    // selection key (enter or ctrl-t), and the third line is the selection
+    // (possibly empty with an accompanying error status). Note that these
+    // split components will not include trailing newlines.
+    let mut parts = bstr::ByteSlice::split_str(&output[..], "\n");
+    let query = parts.next().expect("no query line");
+    let key = parts.next().expect("no key line");
+    let selection = expand_selection(parts.next().expect("no selection line"))?;
+
+    // Check the key before the status. The user may have a query that matches
+    // nothing, in which case Ctrl-T will lead to a non-zero status, which we
+    // ignore.
+    match key {
+        b"" => (), // empty means newline here, fall through
+        b"ctrl-t" => panic!("CTRL-T woo"),
+        _ => panic!(
+            "unexpected selector key: {:?}",
+            String::from_utf8_lossy(key)
+        ),
+    }
 
     // Canonicalize the selection and add that to the history file. This can
     // fail if the selection no longer exists.
-    add_selection_to_history(stripped_selection)?;
+    add_selection_to_history(&selection)?;
 
     // Write the selection to stdout.
-    io::stdout().write_all(stripped_selection)?;
+    io::stdout().write_all(&selection)?;
     io::stdout().flush()?;
     Ok(())
 }
@@ -327,6 +359,6 @@ fn main() -> Result<()> {
         assert_eq!(&args[1], "--add", "unknown arg");
         add_selection_to_history(args[2].as_bytes())
     } else {
-        do_find()
+        run_finder()
     }
 }
