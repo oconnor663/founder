@@ -377,13 +377,6 @@ fn finder_loop() -> Result<()> {
             _ => unreachable!("invalid mode"),
         };
 
-        // If Fzf exited with an error code, we exit with that same code. For
-        // example, we get an error code if the user's filter didn't match
-        // anything.
-        if !status.success() {
-            std::process::exit(status.code().unwrap_or(1));
-        }
-
         // The first line of output is the query string, the second is the
         // selection key (enter or ctrl-t), and the third line is the selection
         // (possibly empty with an accompanying error status). Note that these
@@ -401,6 +394,13 @@ fn finder_loop() -> Result<()> {
                 // This is the newline case, which means the user has made a
                 // selection. Record that selection to history, write it to
                 // stdout, and exit.
+
+                // If Fzf exited with an error code, we exit with that same
+                // code. For example, we get an error code if the user's filter
+                // didn't match anything.
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
 
                 // Canonicalize the selection and add that to the history file. This can
                 // fail if the selection no longer exists.
