@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use clap::{App, Arg, SubCommand};
 use duct::cmd;
 use once_cell::sync::OnceCell;
 use std::collections::HashSet;
@@ -149,12 +150,12 @@ fn compact_history_file() -> Result<()> {
     Ok(())
 }
 
-fn add_selection_to_history(selection: &[u8]) -> Result<()> {
-    let selection_osstr = OsStr::from_bytes(selection);
-    let mut canonical_path: OsString = fs::canonicalize(selection_osstr)
-        .with_context(|| format!("failed to canonicalize {:?}", selection_osstr))?
+fn add_path_to_history(path: &[u8]) -> Result<()> {
+    let path_osstr = OsStr::from_bytes(path);
+    let mut canonical_path: OsString = fs::canonicalize(path_osstr)
+        .with_context(|| format!("failed to canonicalize {:?}", path_osstr))?
         .into();
-    // The selection does not have an extra newline at the end, so we add one.
+    // The path does not have an extra newline at the end, so we add one.
     canonical_path.push("\n");
     let mut history_file = fs::OpenOptions::new()
         .append(true)
@@ -213,7 +214,7 @@ fn expand_selection(selection: &[u8]) -> Result<Vec<u8>> {
 }
 
 // Includes global history, ignores hidden local files.
-fn combined_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
+fn combined_finder(config: &Config, query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
@@ -222,18 +223,11 @@ fn combined_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
     // if the user's filter doesn't match anything, and we'll want to exit with
     // the same code in that case without printing a failure message.
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let fzf_reader = cmd!(
-        "fzf-tmux",
-        "--prompt=combined> ",
-        "--expect=ctrl-t",
-        "--print-query",
-        "--query",
-        query,
-    )
-    .stdin_file(fzf_stdin_read)
-    .unchecked()
-    .reader()
-    .context("failed to start fzf (is is installed?)")?;
+    let fzf_reader = fzf_command(config, "combined", query)
+        .stdin_file(fzf_stdin_read)
+        .unchecked()
+        .reader()
+        .context("failed to start fzf (is is installed?)")?;
     let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
     // Iterate over history lines backwards from the end. That means that the
@@ -314,20 +308,13 @@ fn combined_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
 }
 
 // Includes hidden files, but no history.
-fn local_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
+fn local_finder(config: &Config, query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let fzf_reader = cmd!(
-        "fzf-tmux",
-        "--prompt=local> ",
-        "--expect=ctrl-t",
-        "--print-query",
-        "--query",
-        query,
-    )
-    .stdin_file(fzf_stdin_read)
-    .unchecked()
-    .reader()
-    .context("failed to start fzf (is is installed?)")?;
+    let fzf_reader = fzf_command(config, "local", query)
+        .stdin_file(fzf_stdin_read)
+        .unchecked()
+        .reader()
+        .context("failed to start fzf (is is installed?)")?;
     let fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
 
     // Include --hidden files in this mode.
@@ -366,14 +353,14 @@ fn local_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
     Ok((fzf_status, fzf_output))
 }
 
-fn finder_loop() -> Result<()> {
+fn finder_loop(config: &Config) -> Result<()> {
     let mut mode: u8 = 0;
     let mut saved_query = OsString::new();
     loop {
         const NUM_MODES: u8 = 2;
         let (status, output) = match mode {
-            0 => combined_finder(&saved_query)?,
-            1 => local_finder(&saved_query)?,
+            0 => combined_finder(config, &saved_query)?,
+            1 => local_finder(config, &saved_query)?,
             _ => unreachable!("invalid mode"),
         };
 
@@ -404,12 +391,14 @@ fn finder_loop() -> Result<()> {
 
                 // Canonicalize the selection and add that to the history file.
                 // This can fail if the selection no longer exists.
-                add_selection_to_history(&selection)?;
+                add_path_to_history(&selection)?;
 
                 // Write the selection to stdout. Add a newline to be
-                // compatible with FZF.
+                // compatible with FZF, unless --no-newline is specified.
                 io::stdout().write_all(&selection)?;
-                io::stdout().write_all(b"\n")?;
+                if !config.no_newline {
+                    io::stdout().write_all(b"\n")?;
+                }
                 io::stdout().flush()?;
                 return Ok(());
             }
@@ -429,13 +418,44 @@ fn finder_loop() -> Result<()> {
     }
 }
 
+fn fzf_command(config: &Config, prompt_name: &str, query: &OsStr) -> duct::Expression {
+    let exe = if config.tmux { "fzf-tmux" } else { "fzf" };
+    cmd!(
+        exe,
+        "--prompt",
+        format!("{}> ", prompt_name),
+        "--expect=ctrl-t",
+        "--print-query",
+        "--query",
+        query,
+    )
+}
+
+fn clap_parse_argv() -> clap::ArgMatches<'static> {
+    App::new("founder")
+        .arg(Arg::with_name("no-newline").long("no-newline"))
+        .arg(Arg::with_name("tmux").long("tmux"))
+        .subcommand(
+            SubCommand::with_name("add").arg(Arg::with_name("path").index(1).required(true)),
+        )
+        .get_matches()
+}
+
+struct Config {
+    no_newline: bool,
+    tmux: bool,
+}
+
 fn main() -> Result<()> {
-    let args: Vec<OsString> = env::args_os().collect();
-    if args.len() > 1 {
-        assert_eq!(args.len(), 3, "unexpected number of args");
-        assert_eq!(&args[1], "--add", "unknown arg");
-        add_selection_to_history(args[2].as_bytes())
+    let matches = clap_parse_argv();
+    if let Some(add_matches) = matches.subcommand_matches("add") {
+        let path = add_matches.value_of_os("path").unwrap().as_bytes();
+        add_path_to_history(path)
     } else {
-        finder_loop()
+        let config = Config {
+            no_newline: matches.is_present("no-newline"),
+            tmux: matches.is_present("tmux"),
+        };
+        finder_loop(&config)
     }
 }

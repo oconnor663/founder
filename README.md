@@ -3,7 +3,7 @@
 A CLI fuzzy finder tool, built around `fzf` and `fd`. It remembers files
 you've selected in the past, and past selections are included as
 candidates in future searches even if they're not below the current
-directory. Pressint `<Ctrl-T>` switches between the default "combined"
+directory. Pressing `<Ctrl-T>` switches between the default "combined"
 mode (history plus local non-hidden files) and the "local" mode (all
 local files, including hidden ones).
 
