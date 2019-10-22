@@ -213,7 +213,7 @@ fn expand_selection(selection: &[u8]) -> Result<Vec<u8>> {
 }
 
 // Includes global history, ignores hidden local files.
-fn combined_finder() -> Result<(ExitStatus, Vec<u8>)> {
+fn combined_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
     // Start the fzf child process with a stdout reader and an explicit stdin
     // pipe. Dropping the reader will implicitly kill fzf, though that will
     // only happen if there's an unexpected error. Do this first to mimize the
@@ -226,7 +226,9 @@ fn combined_finder() -> Result<(ExitStatus, Vec<u8>)> {
         "fzf-tmux",
         "--prompt=combined> ",
         "--expect=ctrl-t",
-        "--print-query"
+        "--print-query",
+        "--query",
+        query,
     )
     .stdin_file(fzf_stdin_read)
     .unchecked()
@@ -312,13 +314,15 @@ fn combined_finder() -> Result<(ExitStatus, Vec<u8>)> {
 }
 
 // Includes hidden files, but no history.
-fn local_finder() -> Result<(ExitStatus, Vec<u8>)> {
+fn local_finder(query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
     let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
     let fzf_reader = cmd!(
         "fzf-tmux",
         "--prompt=local> ",
         "--expect=ctrl-t",
-        "--print-query"
+        "--print-query",
+        "--query",
+        query,
     )
     .stdin_file(fzf_stdin_read)
     .unchecked()
@@ -364,11 +368,12 @@ fn local_finder() -> Result<(ExitStatus, Vec<u8>)> {
 
 fn finder_loop() -> Result<()> {
     let mut mode: u8 = 0;
+    let mut saved_query = OsString::new();
     loop {
         const NUM_MODES: u8 = 2;
         let (status, output) = match mode {
-            0 => combined_finder()?,
-            1 => local_finder()?,
+            0 => combined_finder(&saved_query)?,
+            1 => local_finder(&saved_query)?,
             _ => unreachable!("invalid mode"),
         };
 
@@ -384,7 +389,7 @@ fn finder_loop() -> Result<()> {
         // (possibly empty with an accompanying error status). Note that these
         // split components will not include trailing newlines.
         let mut parts = bstr::ByteSlice::split_str(&output[..], "\n");
-        let query = parts.next().expect("no query line");
+        let query = OsStr::from_bytes(parts.next().expect("no query line"));
         let key = parts.next().expect("no key line");
         let selection = expand_selection(parts.next().expect("no selection line"))?;
 
@@ -410,6 +415,8 @@ fn finder_loop() -> Result<()> {
                 // The user pressed Ctrl-T. We change modes, preserving the
                 // query string, and repeat this loop.
                 mode = (mode + 1) % NUM_MODES;
+                saved_query.clear();
+                saved_query.push(query);
                 continue;
             }
             _ => panic!(
