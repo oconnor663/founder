@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{App, Arg, SubCommand};
 use duct::cmd;
 use once_cell::sync::OnceCell;
@@ -13,7 +13,7 @@ use std::process::ExitStatus;
 // Unix-only for now.
 use std::os::unix::ffi::OsStrExt;
 
-const MAX_HISTORY_LINES: usize = 1000;
+const MAX_HISTORY_LINES: u64 = 1000;
 
 fn history_path() -> Result<&'static Path> {
     static HISTORY_PATH: OnceCell<PathBuf> = OnceCell::new();
@@ -50,83 +50,37 @@ fn history_lines_from_most_recent() -> Result<impl Iterator<Item = &'static [u8]
     Ok(bstr::ByteSlice::rsplit_str(bytes, "\n").filter(|line| !line.is_empty()))
 }
 
-fn home_dir() -> io::Result<&'static Path> {
+fn home_dir() -> Result<&'static Path> {
     static HOME_DIR: OnceCell<PathBuf> = OnceCell::new();
     HOME_DIR
         .get_or_try_init(|| match dirs::home_dir() {
             Some(homedir) => Ok(homedir),
-            None => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no home directory configured",
-            )),
+            None => bail!("home directory not configured"),
         })
         .map(|p| p.as_ref())
-}
-
-// Returns an io::Result, so that broken pipe errors can get caught and
-// suppressed by the caller.
-fn filter_fd_output_ioresult(
-    seen_history: &HashSet<&[u8]>,
-    fd_buf_reader: &mut io::BufReader<&duct::ReaderHandle>,
-    // By value, so that it's closed implicitly:
-    mut fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
-) -> io::Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        // Read a line from fd. This will implicitly wait on the fd child
-        // process if the read encounters EOF, though if fd was killed then the
-        // killing thread may have awaited it already.
-        let n = fd_buf_reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            // The output from fd is finished. This thread is done.
-            fzf_buf_writer.flush()?;
-            return Ok(());
-        }
-        // Check the line we just read against the lines from the history file,
-        // and suppress any duplicates.
-        assert_eq!(line[line.len() - 1], b'\n');
-        let stripped_line = &line[..line.len() - 1];
-        if seen_history.contains(stripped_line) {
-            continue;
-        }
-        write_path_to_fzf(stripped_line, &mut fzf_buf_writer)?;
-    }
-}
-
-fn filter_fd_output(
-    seen_history: &HashSet<&[u8]>,
-    fd_buf_reader: &mut io::BufReader<&duct::ReaderHandle>,
-    fzf_buf_writer: io::BufWriter<os_pipe::PipeWriter>,
-) -> Result<()> {
-    match filter_fd_output_ioresult(seen_history, fd_buf_reader, fzf_buf_writer) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                // Suppress broken pipe errors.
-                Ok(())
-            } else {
-                Err(e).context("failed to filter fd output")
-            }
-        }
-    }
 }
 
 fn compact_history_file() -> Result<()> {
     // Iterate over all the history lines, starting with the most recent, and
     // collect the first unique occurrence of each one into a vector.
+    let mut total_lines: u64 = 0;
     let mut lines_set = HashSet::new();
     let mut ordered_unique_lines = Vec::new();
     for line in history_lines_from_most_recent()? {
+        total_lines += 1;
         if lines_set.insert(line) {
             ordered_unique_lines.push(line);
         }
+    }
+    // If the history file does not need to be truncated, short-circuit.
+    if total_lines <= MAX_HISTORY_LINES {
+        return Ok(());
     }
     // Retain only half the maximum number of lines. (Though pruning duplicates
     // above might already have brought us below that.) This means that we'll
     // go a long time between compactions, rather than compacting all the time
     // when the history file is full of unique entries.
-    ordered_unique_lines.truncate(MAX_HISTORY_LINES / 2);
+    ordered_unique_lines.truncate((MAX_HISTORY_LINES / 2) as usize);
     // Write the remaining lines to a temporary file. Once the lines are
     // written, we'll swap it with the real history file. Note that this
     // temporary file must be on the same filesystem as the real one, so a
@@ -169,7 +123,7 @@ fn add_path_to_history(path: &[u8]) -> Result<()> {
 fn write_path_to_fzf(
     path_bytes: &[u8],
     fzf_buf_writer: &mut io::BufWriter<os_pipe::PipeWriter>,
-) -> io::Result<()> {
+) -> Result<()> {
     let path = Path::new(OsStr::from_bytes(path_bytes));
     let mut separator_buf = [0; 4];
     let separator = MAIN_SEPARATOR.encode_utf8(&mut separator_buf);
@@ -213,38 +167,32 @@ fn expand_selection(selection: &[u8]) -> Result<Vec<u8>> {
     Ok(expanded)
 }
 
-// Includes global history, ignores hidden local files.
-fn combined_finder(config: &Config, query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
-    // Start the fzf child process with a stdout reader and an explicit stdin
-    // pipe. Dropping the reader will implicitly kill fzf, though that will
-    // only happen if there's an unexpected error. Do this first to mimize the
-    // delay before fzf appears. Reading to EOF will automatically await the
-    // fzf child process. This is unchecked() because it returns an error code
-    // if the user's filter doesn't match anything, and we'll want to exit with
-    // the same code in that case without printing a failure message.
-    let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let fzf_reader = fzf_command(config, "combined", query)
-        .stdin_file(fzf_stdin_read)
-        .unchecked()
-        .reader()
-        .context("failed to start fzf (is is installed?)")?;
-    let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
+// Inner, because we want to catch any BrokenPipe errors that this returns.
+// This takes a ReaderHandle for fd from the caller, because the caller might
+// kill it from another thread.
+fn input_thread_inner(
+    fd_reader: &duct::ReaderHandle,
+    fzf_stdin_writer: os_pipe::PipeWriter,
+    mode: &Mode,
+) -> Result<()> {
+    // Note that &ReaderHandle implements Read.
+    let mut fd_buf_reader = io::BufReader::new(fd_reader);
+    let mut fzf_buf_writer = io::BufWriter::new(fzf_stdin_writer);
 
-    // Iterate over history lines backwards from the end. That means that the
-    // most recently appended lines come first. For each line, if the current
-    // working directory is a prefix, strip that off. Then write each line to
-    // fzf. These will display in the terminal immediately. Keep track of the
-    // set of lines written so far, to suppress duplicates. (Note that this
-    // relies on fd not putting ./ at the start of the paths it outputs.)
+    // Write all the history lines to fzf first, and collect them in a set so
+    // that we can filter out duplicates from older history lines and from fd.
+    // When we're not in "everything mode", skip over history entries that
+    // aren't under the current working directory. Note that we do include
+    // hidden files from history, regardless of whether we're asking fd to
+    // search for them.
     let cwd = env::current_dir()?;
     let mut seen_history = HashSet::<&[u8]>::new();
-    let mut history_lines: usize = 0;
-    #[allow(clippy::explicit_counter_loop)]
     for line in history_lines_from_most_recent()? {
-        history_lines += 1;
         let mut relative_line = Path::new(OsStr::from_bytes(line));
         if relative_line.starts_with(&cwd) {
             relative_line = relative_line.strip_prefix(&cwd).unwrap();
+        } else if !mode.global_history {
+            continue;
         }
         let relative_line_bytes = relative_line.as_os_str().as_bytes();
         if seen_history.contains(relative_line_bytes) {
@@ -255,36 +203,103 @@ fn combined_finder(config: &Config, query: &OsStr) -> Result<(ExitStatus, Vec<u8
     }
     fzf_buf_writer.flush()?;
 
+    // Now write lines from fd to fzf, filtering out duplicates as noted above.
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Read a line from fd. This will implicitly wait on the fd child
+        // process if the read encounters EOF, though if fd was killed then the
+        // killing thread may have awaited it already.
+        let n = fd_buf_reader.read_until(b'\n', &mut line)?;
+        if n == 0 {
+            // The output from fd is finished. This thread is done.
+            fzf_buf_writer.flush()?;
+            return Ok(());
+        }
+        // Check the line we just read against the lines from the history file,
+        // and suppress any duplicates.
+        assert_eq!(line[line.len() - 1], b'\n');
+        let stripped_line = &line[..line.len() - 1];
+        if seen_history.contains(stripped_line) {
+            continue;
+        }
+        write_path_to_fzf(stripped_line, &mut fzf_buf_writer)?;
+    }
+}
+
+// Catches BrokenPipe errors. This takes a ReaderHandle for fd from the caller,
+// because the caller might kill it from another thread.
+fn input_thread(
+    fd_reader: &duct::ReaderHandle,
+    fzf_stdin_writer: os_pipe::PipeWriter,
+    mode: &Mode,
+) -> Result<()> {
+    // Ignore BrokenPipe errors from input_thread_inner(). We do that here, at
+    // a relatively high level, because we do want these errors to
+    // short-circuit the entire input thread.
+    match input_thread_inner(fd_reader, fzf_stdin_writer, mode) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let maybe_io: Option<&io::Error> = e.root_cause().downcast_ref();
+            if let Some(io_error) = maybe_io {
+                if io_error.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+fn fzf_command(config: &Config, mode: &Mode, query: &OsStr) -> duct::Expression {
+    let exe = if config.tmux { "fzf-tmux" } else { "fzf" };
+    cmd!(
+        exe,
+        "--prompt",
+        format!("{}> ", mode.mode_name),
+        "--expect=ctrl-t",
+        "--print-query",
+        "--query",
+        query,
+    )
+}
+
+fn run_finder_once(config: &Config, mode: &Mode, query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
+    // Open the stdin pipe for FZF. The input thread will receive the write
+    // end.
+    let (fzf_stdin_reader, fzf_stdin_writer) = os_pipe::pipe()?;
+
     // Start the fd child process with a stdout reader. Each line of output
     // from fd will become input to fzf, if it's not a duplicate of what was
-    // already shown from history. This is unchecked() because we might kill it
-    // if it's still running when the user makes a selection.
-    let fd_reader = cmd!("fd", "--type=f")
+    // already shown from history. In "everything mode", tell fd to include
+    // hidden files. The fd command is unchecked() because we will kill it if
+    // it's still running when the user makes a selection. That's also why we
+    // start it here, instead of just letting the input thread do it.
+    let mut fd_args = vec!["--type=f"];
+    if mode.fd_hidden_files {
+        fd_args.push("--hidden");
+    }
+    let fd_reader = cmd("fd", &fd_args)
         .unchecked()
         .reader()
         .context("failed to start fd (is it installed?)")?;
-    let mut fd_buf_reader = io::BufReader::new(&fd_reader);
 
-    let mut fzf_output = Vec::new();
-    crossbeam_utils::thread::scope(|scope| -> Result<()> {
+    // Start the input thread, then await output from fzf.
+    crossbeam_utils::thread::scope(|scope| {
         // Start the background thread that reads the fd pipe and continues
         // writing to the fzf pipe.
-        let fd_thread =
-            scope.spawn(|_| filter_fd_output(&seen_history, &mut fd_buf_reader, fzf_buf_writer));
+        let input_thread = scope.spawn(|_| input_thread(&fd_reader, fzf_stdin_writer, mode));
 
-        // If the history file is at capacity, start another background thread
-        // to compact it. We've already finished reading from the history file
-        // by this point, so rewriting it won't cause any problems.
-        let compact_thread = if history_lines >= MAX_HISTORY_LINES {
-            Some(scope.spawn(|_| compact_history_file()))
-        } else {
-            None
-        };
-
-        // Read the selection from fzf. This implicitly waits on the fzf child
-        // process, but the child returning a non-zero status is unchecked()
-        // here. We'll check that explicitly below.
-        (&fzf_reader).read_to_end(&mut fzf_output)?;
+        // Run FZF and capture its output. This is unchecked() because it
+        // returns an error code if the user's filter doesn't match anything,
+        // and we'll want to exit with the same code in that case without
+        // printing a failure message.
+        let fzf_output = fzf_command(config, mode, query)
+            .stdin_file(fzf_stdin_reader)
+            .stdout_capture()
+            .unchecked()
+            .run()
+            .context("failed to start fzf (is is installed?)")?;
 
         // Kill fd if it's still running, and return an error if the fd thread
         // encountered one. This implicitly waits on the fd child process. Note
@@ -292,84 +307,46 @@ fn combined_finder(config: &Config, query: &OsStr) -> Result<(ExitStatus, Vec<u8
         // exiting with a non-zero status is not considered an error. Errors
         // here are either a rare OS failure (out of memory?) or a bug.
         fd_reader.kill()?;
-        fd_thread.join().unwrap()?;
+        input_thread.join().unwrap()?;
 
-        // Return an error if the history compaction thread encountered one.
-        if let Some(thread) = compact_thread {
-            thread.join().unwrap()?;
-        }
-
-        Ok(())
+        Ok((fzf_output.status, fzf_output.stdout))
     })
-    .unwrap()?;
-
-    let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
-    Ok((fzf_status, fzf_output))
+    .expect("panic in threading scope")
 }
 
-// Includes hidden files, but no history.
-fn local_finder(config: &Config, query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
-    let (fzf_stdin_read, fzf_stdin_write) = os_pipe::pipe()?;
-    let fzf_reader = fzf_command(config, "local", query)
-        .stdin_file(fzf_stdin_read)
-        .unchecked()
-        .reader()
-        .context("failed to start fzf (is is installed?)")?;
-    let fzf_buf_writer = io::BufWriter::new(fzf_stdin_write);
-
-    // Include --hidden files in this mode.
-    let fd_reader = cmd!("fd", "--type=f", "--hidden")
-        .unchecked()
-        .reader()
-        .context("failed to start fd (is it installed?)")?;
-    let mut fd_buf_reader = io::BufReader::new(&fd_reader);
-
-    let empty_history = HashSet::new();
-    let mut fzf_output = Vec::new();
-    crossbeam_utils::thread::scope(|scope| -> Result<()> {
-        // Start the background thread that reads the fd pipe and continues
-        // writing to the fzf pipe. There is no history in this mode.
-        let fd_thread =
-            scope.spawn(|_| filter_fd_output(&empty_history, &mut fd_buf_reader, fzf_buf_writer));
-
-        // Read the selection from fzf. This implicitly waits on the fzf child
-        // process, but the child returning a non-zero status is unchecked()
-        // here. We'll check that explicitly below.
-        (&fzf_reader).read_to_end(&mut fzf_output)?;
-
-        // Kill fd if it's still running, and return an error if the fd thread
-        // encountered one. This implicitly waits on the fd child process. Note
-        // that because of this potential kill signal, fd is unchecked(), and
-        // exiting with a non-zero status is not considered an error. Errors
-        // here are either a rare OS failure (out of memory?) or a bug.
-        fd_reader.kill()?;
-        fd_thread.join().unwrap()?;
-
-        Ok(())
-    })
-    .unwrap()?;
-
-    let fzf_status = fzf_reader.try_wait()?.expect("fzf exited").status;
-    Ok((fzf_status, fzf_output))
+struct Mode {
+    global_history: bool,
+    fd_hidden_files: bool,
+    mode_name: &'static str,
 }
 
-fn finder_loop(config: &Config) -> Result<()> {
-    let mut mode: u8 = 0;
-    let mut saved_query = OsString::new();
+fn run_finder_loop(config: &Config) -> Result<()> {
+    const NUM_MODES: usize = 2;
+    let mut mode_number: usize = 0;
+    let mut previous_query = OsString::new();
     loop {
-        const NUM_MODES: u8 = 2;
-        let (status, output) = match mode {
-            0 => combined_finder(config, &saved_query)?,
-            1 => local_finder(config, &saved_query)?,
+        let mode = match mode_number {
+            0 => Mode {
+                global_history: false,
+                fd_hidden_files: false,
+                mode_name: "local",
+            },
+            1 => Mode {
+                global_history: true,
+                fd_hidden_files: true,
+                mode_name: "everything",
+            },
             _ => unreachable!("invalid mode"),
         };
+
+        let (fzf_status, fzf_output) = run_finder_once(config, &mode, &previous_query)?;
 
         // The first line of output is the query string, the second is the
         // selection key (enter or ctrl-t), and the third line is the selection
         // (possibly empty with an accompanying error status). Note that these
         // split components will not include trailing newlines.
-        let mut parts = bstr::ByteSlice::split_str(&output[..], "\n");
-        let query = OsStr::from_bytes(parts.next().expect("no query line"));
+        let mut parts = bstr::ByteSlice::split_str(&fzf_output[..], "\n");
+        let used_query = OsStr::from_bytes(parts.next().expect("no query line"));
         let key = parts.next().expect("no key line");
         let selection = expand_selection(parts.next().expect("no selection line"))?;
 
@@ -385,8 +362,8 @@ fn finder_loop(config: &Config) -> Result<()> {
                 // If Fzf exited with an error code, we exit with that same
                 // code. For example, we get an error code if the user's filter
                 // didn't match anything.
-                if !status.success() {
-                    std::process::exit(status.code().unwrap_or(1));
+                if !fzf_status.success() {
+                    std::process::exit(fzf_status.code().unwrap_or(1));
                 }
 
                 // Canonicalize the selection and add that to the history file.
@@ -405,9 +382,9 @@ fn finder_loop(config: &Config) -> Result<()> {
             b"ctrl-t" => {
                 // The user pressed Ctrl-T. We change modes, preserving the
                 // query string, and repeat this loop.
-                mode = (mode + 1) % NUM_MODES;
-                saved_query.clear();
-                saved_query.push(query);
+                mode_number = (mode_number + 1) % NUM_MODES;
+                previous_query.clear();
+                previous_query.push(used_query);
                 continue;
             }
             _ => panic!(
@@ -416,19 +393,6 @@ fn finder_loop(config: &Config) -> Result<()> {
             ),
         }
     }
-}
-
-fn fzf_command(config: &Config, prompt_name: &str, query: &OsStr) -> duct::Expression {
-    let exe = if config.tmux { "fzf-tmux" } else { "fzf" };
-    cmd!(
-        exe,
-        "--prompt",
-        format!("{}> ", prompt_name),
-        "--expect=ctrl-t",
-        "--print-query",
-        "--query",
-        query,
-    )
 }
 
 fn clap_parse_argv() -> clap::ArgMatches<'static> {
@@ -447,8 +411,9 @@ struct Config {
 }
 
 fn main() -> Result<()> {
+    let compactor_thread = std::thread::spawn(compact_history_file);
     let matches = clap_parse_argv();
-    if let Some(add_matches) = matches.subcommand_matches("add") {
+    let command_result = if let Some(add_matches) = matches.subcommand_matches("add") {
         let path = add_matches.value_of_os("path").unwrap().as_bytes();
         add_path_to_history(path)
     } else {
@@ -456,6 +421,8 @@ fn main() -> Result<()> {
             no_newline: matches.is_present("no-newline"),
             tmux: matches.is_present("tmux"),
         };
-        finder_loop(&config)
-    }
+        run_finder_loop(&config)
+    };
+    let compactor_result = compactor_thread.join().expect("compactor panic");
+    command_result.and(compactor_result)
 }
