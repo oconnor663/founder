@@ -15,22 +15,30 @@ use std::os::unix::ffi::OsStrExt;
 
 const MAX_HISTORY_LINES: u64 = 1000;
 
-fn history_path() -> Result<&'static Path> {
-    static HISTORY_PATH: OnceCell<PathBuf> = OnceCell::new();
-    HISTORY_PATH
+fn history_dir() -> Result<&'static Path> {
+    static HISTORY_DIR: OnceCell<PathBuf> = OnceCell::new();
+    HISTORY_DIR
         .get_or_try_init(|| {
             let user_data_dir = dirs::data_local_dir().ok_or_else(|| anyhow!("no data dir"))?;
             let founder_dir = user_data_dir.join("founder");
             fs::create_dir_all(&founder_dir).context("failed to create history dir")?;
-            Ok(founder_dir.join("history"))
+            Ok(founder_dir)
         })
         .map(|p| p.as_ref())
 }
 
-fn history_bytes() -> Result<&'static [u8]> {
-    static HISTORY_BYTES: OnceCell<Vec<u8>> = OnceCell::new();
-    HISTORY_BYTES
-        .get_or_try_init(|| match fs::read(history_path()?) {
+fn file_history_path() -> Result<PathBuf> {
+    Ok(history_dir()?.join("file_history"))
+}
+
+fn query_history_path() -> Result<PathBuf> {
+    Ok(history_dir()?.join("query_history"))
+}
+
+fn file_history_bytes() -> Result<&'static [u8]> {
+    static FILE_HISTORY_BYTES: OnceCell<Vec<u8>> = OnceCell::new();
+    FILE_HISTORY_BYTES
+        .get_or_try_init(|| match fs::read(file_history_path()?) {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -46,7 +54,7 @@ fn history_bytes() -> Result<&'static [u8]> {
 
 // These lines do not include the terminating newline.
 fn history_lines_from_most_recent() -> Result<impl Iterator<Item = &'static [u8]>> {
-    let bytes = history_bytes()?;
+    let bytes = file_history_bytes()?;
     Ok(bstr::ByteSlice::rsplit_str(bytes, "\n").filter(|line| !line.is_empty()))
 }
 
@@ -85,7 +93,7 @@ fn compact_history_file() -> Result<()> {
     // written, we'll swap it with the real history file. Note that this
     // temporary file must be on the same filesystem as the real one, so a
     // standard temp file in /tmp doesn't work here.
-    let temp_file_path = history_path()?.with_extension("tmp");
+    let temp_file_path = file_history_path()?.with_extension("tmp");
     let temp_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true) // error if the file already exists
@@ -100,7 +108,7 @@ fn compact_history_file() -> Result<()> {
     temp_file_writer.flush()?;
     drop(temp_file_writer);
     // Swap the new history file into place.
-    fs::rename(&temp_file_path, history_path()?)?;
+    fs::rename(&temp_file_path, file_history_path()?)?;
     Ok(())
 }
 
@@ -114,7 +122,7 @@ fn add_path_to_history(path: &[u8]) -> Result<()> {
     let mut history_file = fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(history_path()?)?;
+        .open(file_history_path()?)?;
     history_file.write_all(canonical_path.as_bytes())?;
     Ok(())
 }
@@ -251,9 +259,9 @@ fn input_thread(
     }
 }
 
-fn fzf_command(config: &Config, mode: &Mode, query: &OsStr) -> duct::Expression {
+fn fzf_command(config: &Config, mode: &Mode, query: &OsStr) -> Result<duct::Expression> {
     let exe = if config.tmux { "fzf-tmux" } else { "fzf" };
-    cmd!(
+    Ok(cmd!(
         exe,
         "--prompt",
         format!("{}> ", mode.mode_name),
@@ -261,7 +269,10 @@ fn fzf_command(config: &Config, mode: &Mode, query: &OsStr) -> duct::Expression 
         "--print-query",
         "--query",
         query,
-    )
+        "--history",
+        query_history_path()?,
+        "--history-size=100"
+    ))
 }
 
 fn run_finder_once(config: &Config, mode: &Mode, query: &OsStr) -> Result<(ExitStatus, Vec<u8>)> {
@@ -294,7 +305,7 @@ fn run_finder_once(config: &Config, mode: &Mode, query: &OsStr) -> Result<(ExitS
         // returns an error code if the user's filter doesn't match anything,
         // and we'll want to exit with the same code in that case without
         // printing a failure message.
-        let fzf_output = fzf_command(config, mode, query)
+        let fzf_output = fzf_command(config, mode, query)?
             .stdin_file(fzf_stdin_reader)
             .stdout_capture()
             .unchecked()
