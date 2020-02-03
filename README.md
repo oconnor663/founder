@@ -9,3 +9,18 @@ local files, including hidden ones).
 
 This is a work in progress, and it's not ready for anyone else to use
 yet.
+
+## Vim integration
+
+Here's what I do:
+
+```vim
+function OpenFounder()
+  let l:filepath = system("founder --tmux --no-newline")
+  if v:shell_error == 0
+    execute "e ".fnameescape(l:filepath)
+  endif
+endfunction
+nnoremap <C-t> :call OpenFounder()<CR>
+autocmd BufEnter * call system("founder add " . fnameescape(@%))
+```
