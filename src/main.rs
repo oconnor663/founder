@@ -114,16 +114,22 @@ fn compact_history_file() -> Result<()> {
 
 fn add_path_to_history(path: &[u8]) -> Result<()> {
     let path_osstr = OsStr::from_bytes(path);
-    let mut canonical_path: OsString = fs::canonicalize(path_osstr)
-        .with_context(|| format!("failed to canonicalize {:?}", path_osstr))?
-        .into();
+    // Note that we don't use std::fs::canonicalize here. That fails for files
+    // that don't exist. (A common example is "vim foo.txt". That file doesn't
+    // exist until you save it, but we want to add it to history immediately.)
+    // It's also better not to resolve symbolic links, but to allow different
+    // paths to the same file to exist separately in history.
+    let mut absolute_path = path_abs::PathAbs::new(path_osstr)?
+        .as_path()
+        .as_os_str()
+        .to_owned();
     // The path does not have an extra newline at the end, so we add one.
-    canonical_path.push("\n");
+    absolute_path.push("\n");
     let mut history_file = fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(file_history_path()?)?;
-    history_file.write_all(canonical_path.as_bytes())?;
+    history_file.write_all(absolute_path.as_bytes())?;
     Ok(())
 }
 
@@ -377,8 +383,7 @@ fn run_finder_loop(config: &Config) -> Result<()> {
                     std::process::exit(fzf_status.code().unwrap_or(1));
                 }
 
-                // Canonicalize the selection and add that to the history file.
-                // This can fail if the selection no longer exists.
+                // Absolutify the selection and add that to the history file.
                 add_path_to_history(&selection)?;
 
                 // Write the selection to stdout. Add a newline to be
