@@ -212,6 +212,9 @@ fn input_thread_inner(
         if seen_history.contains(relative_line_bytes) {
             continue;
         }
+        if !relative_line.exists() {
+            continue;
+        }
         write_path_to_fzf(relative_line_bytes, &mut fzf_buf_writer)?;
         seen_history.insert(relative_line_bytes);
     }
