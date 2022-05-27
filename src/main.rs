@@ -295,7 +295,7 @@ fn run_finder_once(config: &Config, mode: &Mode, query: &OsStr) -> Result<(ExitS
     // hidden files. The fd command is unchecked() because we will kill it if
     // it's still running when the user makes a selection. That's also why we
     // start it here, instead of just letting the input thread do it.
-    let mut fd_args = vec!["--type=f"];
+    let mut fd_args = vec!["--type=f", "--strip-cwd-prefix"];
     if mode.fd_hidden_files {
         fd_args.push("--hidden");
     }
