@@ -319,7 +319,7 @@ fn run_finder_once(config: &Config, mode: &Mode, query: &OsStr) -> Result<(ExitS
             .stdout_capture()
             .unchecked()
             .run()
-            .context("failed to start fzf (is is installed?)")?;
+            .context("failed to start fzf or fzf-tmux (are they installed?)")?;
 
         // Kill fd if it's still running, and return an error if the fd thread
         // encountered one. This implicitly waits on the fd child process. Note
